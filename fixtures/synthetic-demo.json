@@ -1,0 +1,11 @@
+{
+  "id": "synthetic-demo",
+  "modified": "2025-01-01T12:00:00Z",
+  "messages": [
+    {"id": "u1", "role": "user", "text": "机器人机械臂如何确认限位？"},
+    {"id": "a1", "role": "assistant", "text": "这是虚构记录：计划在测试台检查左侧和右侧限位。"},
+    {"id": "u2", "role": "user", "text": "换个话题，水利项目的闸门和水位如何记录？"},
+    {"id": "a2", "role": "assistant", "text": "这是虚构记录：每次写入测点、采集时间和读数。"}
+  ]
+}
+
