@@ -101,8 +101,12 @@ def _selected_paths(root: Path, allowed: set[str] | None) -> dict[str, Path | No
     return candidates
 
 
+def _entry(info: os.stat_result) -> tuple[int, int, int, int]:
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+
 def _fingerprint(info: os.stat_result) -> tuple[int, int, int, int, int]:
-    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+    return (*_entry(info), info.st_ctime_ns)
 
 
 def _parse_line(raw: bytes) -> dict:
@@ -197,7 +201,7 @@ def _read_one(path: Path, thread_id: str, owner: tuple[str, str] | None, *, meta
     buffering = 0 if owner is not None else -1
     with os.fdopen(fd, "rb", buffering=buffering) as raw:
         opened = os.fstat(raw.fileno())
-        if not stat.S_ISREG(opened.st_mode) or _fingerprint(opened) != _fingerprint(before):
+        if not stat.S_ISREG(opened.st_mode) or not opened.st_ino or _entry(opened) != _entry(before):
             raise _Deferred
         meta_row = raw.readline(_MAX_META_BYTES + 1)
         if len(meta_row) > _MAX_META_BYTES:
@@ -205,7 +209,7 @@ def _read_one(path: Path, thread_id: str, owner: tuple[str, str] | None, *, meta
         _check_meta(_parse_line(meta_row), thread_id, owner)
         if meta_only:
             _ancestors(path.parent)
-            if _fingerprint(_stat(path, directory=False)) != _fingerprint(before) or _fingerprint(os.fstat(raw.fileno())) != _fingerprint(before):
+            if _fingerprint(_stat(path, directory=False)) != _fingerprint(before) or _fingerprint(os.fstat(raw.fileno())) != _fingerprint(opened):
                 raise _Deferred
             return {}
         # A wrapper on this same open handle starts at byte after the first
@@ -254,7 +258,7 @@ def _read_one(path: Path, thread_id: str, owner: tuple[str, str] | None, *, meta
         # interval. Defer that exchange, not the completed history before it.
         if not withheld and len(turn) > 1:
             accepted.extend(turn)
-        if _fingerprint(os.fstat(handle.fileno())) != _fingerprint(before):
+        if _fingerprint(os.fstat(handle.fileno())) != _fingerprint(opened):
             raise _Deferred
     _ancestors(path.parent)
     if not accepted or _fingerprint(_stat(path, directory=False)) != _fingerprint(before):

@@ -376,10 +376,14 @@ def scan(cfg, root, stats):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", type=Path, required=True)
+    p.add_argument("--allow-start", action="store_true",
+                   help="Allow this run to invoke the explicitly configured local launcher once.")
     p.add_argument("action", choices=["scan", "publish", "sync"])
     args = p.parse_args(argv)
     try:
         cfg = read_json(absolute(args.config))
+        if args.allow_start and args.action == "scan":
+            raise ValueError("scan may not start a service")
         root = absolute(cfg["work_dir"])
         blocked_path(root)
         # Never write outbox or private state into a Git checkout.
@@ -391,7 +395,7 @@ def main(argv=None):
             if args.action in ("scan", "sync"):
                 scan(cfg, root, stats)
             if args.action in ("publish", "sync") and not stats["source_errors"]:
-                from ragflow_local import publish
+                from ragflow_local import Client, UPDATE_MODES, checked_id, publish
                 target = cfg["ragflow"]
                 token = os.environ.get("RAGFLOW_API_KEY", "")
                 if not token:
@@ -399,7 +403,43 @@ def main(argv=None):
                 keys = read_json(root / "publish-ready.json")
                 if not isinstance(keys, list) or not all(isinstance(k, str) and re.fullmatch(r"[0-9a-f]{64}", k) for k in keys):
                     raise ValueError("invalid publication scope; run scan again")
-                stats["ragflow"] = publish(root, target["dataset_id"], target["origin"], token, allowed_topics=set(keys))
+                update_mode = target.get("update_mode", "revision")
+                if update_mode not in UPDATE_MODES:
+                    raise ValueError("invalid update mode")
+                # Validate the fixed destination and key before an optional launch.
+                Client(target["origin"], token)
+                checked_id(target["dataset_id"])
+                readiness = target.get("readiness")
+                ready = True
+                if readiness is not None or args.allow_start:
+                    from ragflow_ready import ensure_ready
+                    if not isinstance(readiness, dict) or set(readiness) - {
+                        "total_timeout", "probe_timeout", "poll_interval",
+                        "launcher_argv", "launcher_timeout", "launcher_cwd",
+                    } or (args.allow_start and not readiness.get("launcher_argv")):
+                        raise ValueError("invalid readiness configuration")
+                    if args.allow_start:
+                        # Keep startup errors available locally without sending raw
+                        # subprocess output, arguments, or paths to a scheduler.
+                        with tempfile.NamedTemporaryFile(mode="w+b", dir=root, prefix=".ragflow-start-",
+                                                       suffix=".log", delete=False) as log:
+                            log_path = Path(log.name)
+                            check = ensure_ready(target["origin"], allow_start=True, launcher_stderr=log,
+                                                 **readiness)
+                        if not check.launcher_attempted:
+                            log_path.unlink(missing_ok=True)
+                    else:
+                        check = ensure_ready(target["origin"], allow_start=False, **readiness)
+                    ready = check.ready
+                    stats["ragflow_readiness"] = {"status": check.status, "reason": check.reason,
+                                                  "probes": check.probes, "ready": ready,
+                                                  "launcher_attempted": check.launcher_attempted,
+                                                  "launcher_returncode": check.launcher_returncode}
+                if ready:
+                    stats["ragflow"] = publish(root, target["dataset_id"], target["origin"], token,
+                                               allowed_topics=set(keys), update_mode=update_mode)
+                else:
+                    stats["ragflow"] = {"published": 0, "unchanged": 0, "pending": 0, "failed": 1}
         print(json.dumps(stats, ensure_ascii=True, sort_keys=True))
         return 1 if stats["source_errors"] or any(stats.get("ragflow", {}).get(k) for k in ("failed", "pending")) else 0
     except (OSError, ValueError, TypeError, KeyError, ImportError, RuntimeError):

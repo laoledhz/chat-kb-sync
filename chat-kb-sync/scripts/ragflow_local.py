@@ -22,6 +22,7 @@ HASH = re.compile(r"[0-9a-f]{64}")
 ID = re.compile(r"[0-9a-f]{32}")
 MAX_NOTE = 1_000_000
 MAX_JSON = 8_000_000
+UPDATE_MODES = ("revision", "inplace-index")
 BATCH = 40
 PARSER = "Parser:HipSignsRhyme"
 CHUNKER = "GeneralChunker:SixApplesFall"
@@ -218,14 +219,28 @@ def read_file(path: Path, limit: int, missing=False):
         raise
     if not no_link(before) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
         raise ArchiveError("Archive file is not a normal unlinked file.")
-    fingerprint = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
-    with path.open("rb") as file:
+    def identity(s):
+        return (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
+
+    def unchanged(first, second):
+        return (no_link(second) and stat.S_ISREG(second.st_mode) and second.st_nlink == 1
+                and identity(first) == identity(second) and first.st_ctime_ns == second.st_ctime_ns)
+
+    handle = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                     | getattr(os, "O_BINARY", 0))
+    with os.fdopen(handle, "rb") as file:
         opened = os.fstat(file.fileno())
-        if fingerprint(opened) != fingerprint(before):
+        # On Windows the path-stat and handle-stat APIs can report slightly
+        # different creation times for the same new file. Compare ctime within
+        # each API, not across them, while checking identity and mtime both ways.
+        if (not no_link(opened) or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                or identity(opened) != identity(before)
+                or (os.name != "nt" and opened.st_ctime_ns != before.st_ctime_ns)):
             raise ArchiveError("Archive file changed during read; rerun.")
         data = file.read(limit + 1)
         after = os.fstat(file.fileno())
-    if len(data) > limit or fingerprint(after) != fingerprint(before):
+    if (len(data) > limit or not unchanged(opened, after)
+            or not unchanged(before, path.lstat())):
         raise ArchiveError("Archive file changed or exceeded its limit; rerun.")
     return data
 
@@ -285,7 +300,19 @@ def documents(client: Client, base: str, **filters) -> list:
 
 
 def lookup(client: Client, base: str, dataset_id: str, name: str, document_id: str | None = None):
-    rows = documents(client, base, **({"id": document_id} if document_id else {"name": name}))
+    if document_id:
+        rows = documents(client, base, id=document_id)
+    else:
+        # Go 1.0 treats a missing ?name= as an ownership error, not an empty list.
+        # Search only the validated dedicated dataset, comparing full names locally.
+        rows = []
+        for page in range(1, 102):
+            listed = documents(client, base, page=page, page_size=100)
+            rows.extend(row for row in listed if row.get("name") == name)
+            if len(listed) < 100:
+                break
+        else:
+            raise ArchiveError("Archive document listing exceeded its bound.")
     if len(rows) > 1:
         raise ArchiveError("Ambiguous archive revision in RAGFlow; manual review required.")
     if not rows:
@@ -351,9 +378,12 @@ def check_map(state: dict) -> None:
             if item is None:
                 continue
             keys = {"digest", "id"} if kind == "active" else {"digest", "payload", "not_before"}
+            if (kind == "active" and state.get("update_mode") == "inplace-index"
+                    and isinstance(item, dict) and "source_digest" in item):
+                keys.add("source_digest")
             if (not isinstance(item, dict) or set(item) != keys or
                     any(not isinstance(item[k], str) or not HASH.fullmatch(item[k])
-                        for k in keys & {"digest", "payload"}) or
+                        for k in keys & {"digest", "payload", "source_digest"}) or
                     ("not_before" in keys and type(item["not_before"]) is not int)):
                 raise ArchiveError("Invalid revision record in archive state.")
             if kind == "active":
@@ -438,8 +468,11 @@ def advance(client: Client, base: str, dataset_id: str, topic: str, note: bytes,
     return "published" if pending["digest"] == digest else "pending"
 
 
-def publish(root: Path, dataset_id: str, origin: str, token: str, *, allowed_topics: set[str] | None = None) -> dict:
+def publish(root: Path, dataset_id: str, origin: str, token: str, *,
+            allowed_topics: set[str] | None = None, update_mode: str = "revision") -> dict:
     """Advance a bounded number of approved RAGFlow writes. Reinvoke to confirm queued parses."""
+    if update_mode not in UPDATE_MODES:
+        raise ArchiveError("Unrecognized archive update mode.")
     if allowed_topics is not None and any(not isinstance(t, str) or not HASH.fullmatch(t) for t in allowed_topics):
         raise ArchiveError("Invalid topic allowlist.")
     root = safe_directory(root)
@@ -455,7 +488,7 @@ def publish(root: Path, dataset_id: str, origin: str, token: str, *, allowed_top
         if raw_state is None:
             if dataset.get("document_count") != 0 or documents(client, base):
                 raise ArchiveError("A new state can only bind to a fresh dedicated archive dataset.")
-            state = {"version": 1, "target": target, "topics": {}}
+            state = {"version": 1, "target": target, "topics": {}, "update_mode": update_mode}
             save_state(state_path, state)
         else:
             try:
@@ -464,6 +497,8 @@ def publish(root: Path, dataset_id: str, origin: str, token: str, *, allowed_top
                 raise ArchiveError("Archive state could not be read; preserve it for recovery.") from None
         if not isinstance(state, dict) or state.get("version") != 1 or state.get("target") != target:
             raise ArchiveError("State belongs to another archive or incompatible version.")
+        if state.get("update_mode", "revision") != update_mode:
+            raise ArchiveError("The archive update mode is bound to its saved state; do not change it in place.")
         check_map(state)
         paths = sorted(p for p in outbox.glob("*.md")
                        if HASH.fullmatch(p.stem) and (allowed_topics is None or p.stem in allowed_topics))
@@ -490,7 +525,16 @@ def publish(root: Path, dataset_id: str, origin: str, token: str, *, allowed_top
                     processed += 1
                     state["resume_after"] = path.stem
                 # No routine API polling on already committed, unchanged notes.
-                key = advance(client, base, dataset_id, path.stem, note, state, state_path) if needs_write else "unchanged"
+                key = "unchanged"
+                if needs_write and update_mode == "inplace-index":
+                    from ragflow_inplace import revised_text, update
+                    revised_text(note)  # Enforce the bound before initial upload, too.
+                    if rec and rec["active"]:
+                        key = update(client, base, dataset_id, path.stem, note, state, state_path)
+                    else:
+                        key = advance(client, base, dataset_id, path.stem, note, state, state_path)
+                elif needs_write:
+                    key = advance(client, base, dataset_id, path.stem, note, state, state_path)
                 counts[key] += 1
             except (ArchiveError, OSError, UnicodeError):
                 counts["failed"] += 1
@@ -512,13 +556,14 @@ def main() -> int:
     send = commands.add_parser("publish")
     send.add_argument("root", type=Path)
     send.add_argument("dataset_id")
+    send.add_argument("--update-mode", choices=UPDATE_MODES, default="revision")
     args = parser.parse_args()
     token = os.environ.get("RAGFLOW_API_KEY", "")
     try:
         if args.command == "create-dataset":
             result = {"dataset_id": create_archive_dataset(args.origin, token, args.name, args.language)}
         else:
-            result = publish(args.root, args.dataset_id, args.origin, token)
+            result = publish(args.root, args.dataset_id, args.origin, token, update_mode=args.update_mode)
     except (ArchiveError, OSError) as error:
         print(str(error) if isinstance(error, ArchiveError) else "Cannot access the private archive directory.")
         return 1
